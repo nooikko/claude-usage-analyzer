@@ -12,25 +12,27 @@ Parses the JSONL session files that Claude Code writes to `~/.claude/projects/` 
 - **Subagent cost** — dispatches, result sizes, agent file token usage
 - **Bash command frequency**
 
-## Install
+## Quick start
+
+No install required — just clone and run:
 
 ```bash
-# Create a virtual environment (required on macOS with Homebrew Python)
-python3 -m venv .venv
-source .venv/bin/activate
-
-pip install .                     # basic install
-pip install '.[excel]'            # with Excel export support
+git clone https://github.com/nooikko/claude-usage-analyzer.git
+cd claude-usage-analyzer
+./claude-usage --days 7
 ```
 
-Or run directly without installing:
+Requires Python 3.11+.
+
+### Optional: pip install
+
+If you want the `claude-usage` command available globally:
 
 ```bash
-# With venv activated:
-python -m claude_usage_analyzer
-
-# Without venv:
-PYTHONPATH=src python3 -m claude_usage_analyzer
+python3 -m venv .venv
+source .venv/bin/activate
+pip install .                     # basic install
+pip install '.[excel]'            # with Excel export support
 ```
 
 ## Usage
