@@ -1,0 +1,505 @@
+"""ASCII table formatter — prints to stdout."""
+
+from __future__ import annotations
+
+import sys
+
+from ..utils import cache_hit_rate, format_tokens
+
+
+def _table(headers, rows, title="", file=sys.stdout):
+    if title:
+        print(f"\n{'=' * 70}", file=file)
+        print(f"  {title}", file=file)
+        print(f"{'=' * 70}", file=file)
+    if not rows:
+        print("  (no data)", file=file)
+        return
+
+    col_widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            col_widths[i] = max(col_widths[i], len(str(cell)))
+
+    hdr = "  ".join(str(h).ljust(col_widths[i]) for i, h in enumerate(headers))
+    print(f"\n  {hdr}", file=file)
+    print(f"  {'  '.join('-' * w for w in col_widths)}", file=file)
+    for row in rows:
+        line = "  ".join(str(c).ljust(col_widths[i]) for i, c in enumerate(row))
+        print(f"  {line}", file=file)
+
+
+# ---- Section builders -----------------------------------------------------
+
+def _section_models(stats, top_n, f):
+    rows = []
+    for model, d in sorted(stats["by_model"].items(),
+                            key=lambda x: x[1]["cache_read"] + x[1]["cache_create"] + x[1]["input_tokens"],
+                            reverse=True):
+        rows.append([
+            model,
+            format_tokens(d["input_tokens"]),
+            format_tokens(d["cache_read"]),
+            format_tokens(d["cache_create"]),
+            cache_hit_rate(d["cache_read"], d["cache_create"], d["input_tokens"]),
+            format_tokens(d["output_tokens"]),
+            d["requests"],
+        ])
+    _table(["Model", "Uncached", "Cache Read", "Cache Create", "Hit Rate", "Output", "Reqs"],
+           rows, "TOKEN USAGE BY MODEL", f)
+
+
+def _section_projects(stats, top_n, f):
+    rows = []
+    for proj, d in sorted(stats["by_project"].items(),
+                           key=lambda x: x[1]["output_tokens"], reverse=True)[:top_n]:
+        rows.append([
+            proj[:35],
+            format_tokens(d["input_tokens"]),
+            format_tokens(d["cache_read"]),
+            cache_hit_rate(d["cache_read"], d["cache_create"], d["input_tokens"]),
+            format_tokens(d["output_tokens"]),
+            d["requests"], d["sessions"], d["tool_calls"],
+        ])
+    _table(["Project", "Uncached", "Cache Read", "Hit Rate", "Output", "Reqs", "Sessions", "Tools"],
+           rows, f"TOKEN USAGE BY PROJECT (top {top_n})", f)
+
+
+def _section_cache_daily(stats, top_n, f):
+    date_model_data: dict[str, dict] = {}
+    for dm_key, d in stats["cache_by_date"].items():
+        date, model = dm_key.split("|", 1)
+        if date == "unknown":
+            continue
+        date_model_data.setdefault(date, {})[model] = d
+
+    daily = {}
+    for date, models in sorted(date_model_data.items()):
+        daily[date] = {
+            "input_tokens": sum(m["input_tokens"] for m in models.values()),
+            "cache_read": sum(m["cache_read"] for m in models.values()),
+            "cache_create": sum(m["cache_create"] for m in models.values()),
+            "requests": sum(m["requests"] for m in models.values()),
+        }
+
+    rows = []
+    for date in sorted(daily)[-top_n:]:
+        d = daily[date]
+        total = d["input_tokens"] + d["cache_read"] + d["cache_create"]
+        miss = f"{(d['input_tokens'] + d['cache_create']) / total * 100:.1f}%" if total else "-"
+        rows.append([
+            date,
+            format_tokens(d["cache_read"]),
+            format_tokens(d["cache_create"]),
+            format_tokens(d["input_tokens"]),
+            cache_hit_rate(d["cache_read"], d["cache_create"], d["input_tokens"]),
+            miss, d["requests"],
+        ])
+    _table(["Date", "Cache Read", "Cache Create", "Uncached", "Hit Rate", "Miss Rate", "Reqs"],
+           rows, f"DAILY CACHE HIT RATE (last {top_n} days)\n  Hit = cache_read / total_input_context", f)
+
+    # Per-model daily
+    sig = [m for m, d in stats["by_model"].items() if d["requests"] > 100 and m != "<synthetic>"]
+    for model in sig[:4]:
+        rows = []
+        for date in sorted(date_model_data)[-top_n:]:
+            if model not in date_model_data[date]:
+                continue
+            d = date_model_data[date][model]
+            rows.append([
+                date,
+                format_tokens(d["cache_read"]),
+                format_tokens(d["cache_create"]),
+                format_tokens(d["input_tokens"]),
+                cache_hit_rate(d["cache_read"], d["cache_create"], d["input_tokens"]),
+                d["requests"],
+            ])
+        if rows:
+            short = (model.replace("claude-", "")
+                     .replace("-20251001", "").replace("-20251101", "")
+                     .replace("-20250929", "").replace("-20250805", "")
+                     .replace("-20250514", ""))
+            _table(["Date", "Cache Read", "Cache Create", "Uncached", "Hit Rate", "Reqs"],
+                   rows, f"DAILY CACHE: {short}", f)
+
+
+def _section_cache_projects(stats, top_n, f):
+    rows = []
+    for proj, d in sorted(stats["by_project"].items(),
+                           key=lambda x: x[1]["cache_read"] + x[1]["cache_create"] + x[1]["input_tokens"],
+                           reverse=True)[:top_n]:
+        total = d["input_tokens"] + d["cache_read"] + d["cache_create"]
+        if total == 0:
+            continue
+        rows.append([
+            proj[:35],
+            format_tokens(d["cache_read"]),
+            format_tokens(d["cache_create"]),
+            format_tokens(d["input_tokens"]),
+            cache_hit_rate(d["cache_read"], d["cache_create"], d["input_tokens"]),
+            f"{d['input_tokens'] / total * 100:.1f}%",
+            d["requests"],
+        ])
+    _table(["Project", "Cache Read", "Cache Create", "Uncached", "Hit Rate", "Uncached %", "Reqs"],
+           rows, f"CACHE HIT RATE BY PROJECT (top {top_n})", f)
+
+
+def _section_worst_cache_sessions(stats, top_n, f):
+    items = []
+    for sid, sess in stats["sessions"].items():
+        total = sess["input_tokens"] + sess["cache_read"] + sess["cache_create"]
+        if total >= 100_000:
+            items.append((sid, sess, sess["cache_read"] / total, total))
+    items.sort(key=lambda x: x[2])
+
+    rows = []
+    for sid, sess, _, _ in items[:top_n]:
+        rows.append([
+            sid[:20] + "...",
+            sess["project"][:20],
+            format_tokens(sess["cache_read"]),
+            format_tokens(sess["cache_create"]),
+            format_tokens(sess["input_tokens"]),
+            cache_hit_rate(sess["cache_read"], sess["cache_create"], sess["input_tokens"]),
+            sess.get("start", "")[:10] if sess.get("start") else "-",
+        ])
+    if rows:
+        _table(["Session", "Project", "Cache Read", "Cache Create", "Uncached", "Hit Rate", "Date"],
+               rows, "SESSIONS WITH WORST CACHE HIT RATE (min 100K context)", f)
+
+
+def _section_tool_cost(stats, top_n, f):
+    rows = []
+    for tool, d in sorted(stats["tool_result_cost"].items(),
+                           key=lambda x: x[1]["total_chars"], reverse=True)[:top_n]:
+        avg = d["total_chars"] // d["count"] if d["count"] else 0
+        top_proj = max(d["by_project"].items(), key=lambda x: x[1])[0] if d["by_project"] else "-"
+        rows.append([
+            tool, d["count"],
+            format_tokens(d["total_chars"] // 4),
+            format_tokens(avg // 4),
+            format_tokens(d["max_single"] // 4),
+            top_proj[:25],
+        ])
+    _table(["Tool", "Calls", "Total Est Tok", "Avg/Call", "Max Single", "Top Project"],
+           rows, f"TOOL RESULT CONTEXT COST (top {top_n})\n  How much context each tool's results inject", f)
+
+    raw = []
+    for tool, d in stats["tool_result_cost"].items():
+        for proj, chars in d["by_project"].items():
+            raw.append((tool, proj[:30], chars))
+    raw.sort(key=lambda x: x[2], reverse=True)
+    rows = [(t, p, format_tokens(c // 4)) for t, p, c in raw[:top_n]]
+    _table(["Tool", "Project", "Est Tokens Injected"],
+           rows, f"TOOL RESULT COST BY PROJECT (top {top_n})", f)
+
+
+def _section_hooks(stats, top_n, f):
+    if not stats["hook_injection_cost"]:
+        return
+    rows = []
+    total_chars = 0
+    for cat, d in sorted(stats["hook_injection_cost"].items(),
+                          key=lambda x: x[1]["total_chars"], reverse=True)[:top_n]:
+        avg = d["total_chars"] // d["count"] if d["count"] else 0
+        total_chars += d["total_chars"]
+        top_proj = max(d["by_project"].items(), key=lambda x: x[1])[0] if d["by_project"] else "-"
+        rows.append([cat, d["count"], format_tokens(d["total_chars"] // 4),
+                     format_tokens(avg // 4), top_proj[:25]])
+    _table(["Hook/System Category", "Injections", "Total Est Tok", "Avg/Injection", "Top Project"],
+           rows, f"HOOK & SYSTEM-REMINDER CONTEXT COST (top {top_n})\n  Extra context injected via <system-reminder> tags", f)
+    print(f"\n  TOTAL hook/system injection: ~{format_tokens(total_chars // 4)} tokens", file=f)
+    print("  Note: hooks that fire every turn compound across the conversation.", file=f)
+
+
+def _section_skills(stats, top_n, f):
+    if not stats["skill_cost"]:
+        return
+    rows = []
+    for skill, d in sorted(stats["skill_cost"].items(),
+                            key=lambda x: x[1]["total_chars"], reverse=True)[:top_n]:
+        avg = d["total_chars"] // d["count"] if d["count"] else 0
+        top_proj = max(d["by_project"].items(), key=lambda x: x[1])[0] if d["by_project"] else "-"
+        rows.append([skill[:40], d["count"], format_tokens(d["total_chars"] // 4),
+                     format_tokens(avg // 4), top_proj[:25]])
+    _table(["Skill", "Loads", "Total Est Tok", "Avg/Load", "Top Project"],
+           rows, f"SKILL CONTENT COST (top {top_n})\n  How much context each skill loads when invoked", f)
+
+
+def _section_subagents(stats, top_n, f):
+    if stats["by_subagent_type"]:
+        rows = []
+        for sa, d in sorted(stats["by_subagent_type"].items(),
+                             key=lambda x: x[1]["count"], reverse=True)[:top_n]:
+            rk = f"result|{sa}"
+            rd = stats["subagent_cost"].get(rk, {})
+            rt = rd.get("input_tokens", 0)
+            top_proj = max(d["by_project"].items(), key=lambda x: x[1])[0] if d["by_project"] else "-"
+            sample = d["descriptions"][0][:35] if d["descriptions"] else "-"
+            rows.append([
+                sa[:30], d["count"],
+                format_tokens(rt) if rt else "-",
+                format_tokens(rt // d["count"]) if rt and d["count"] else "-",
+                top_proj[:20], sample,
+            ])
+        _table(["Subagent Type", "Dispatches", "Result Tok", "Avg Result", "Top Project", "Sample"],
+               rows, f"SUBAGENT DISPATCHES & RESULT COST (top {top_n})", f)
+
+    entries = {k: v for k, v in stats["subagent_cost"].items() if not k.startswith("result|")}
+    if entries:
+        rows = []
+        for sa_key, d in sorted(entries.items(),
+                                 key=lambda x: x[1]["cache_read"] + x[1]["output_tokens"],
+                                 reverse=True)[:top_n]:
+            parts = sa_key.split("|", 1)
+            model, sa_type = (parts[0], parts[1]) if len(parts) > 1 else (sa_key, "unknown")
+            total_ctx = d["input_tokens"] + d["cache_read"] + d["cache_create"]
+            rows.append([model[:25], sa_type[:20], d.get("agent_count", 0),
+                         d["requests"], format_tokens(total_ctx), format_tokens(d["output_tokens"])])
+        _table(["Model", "Type", "Agents", "API Calls", "Total Context", "Output"],
+               rows, "SUBAGENT FILE TOKEN USAGE (from agent-*.jsonl)", f)
+
+
+def _section_bash(stats, top_n, f):
+    if not stats["by_bash_command"]:
+        return
+    bash_result = stats["tool_result_cost"].get("Bash", {})
+    rows = []
+    for cmd, d in sorted(stats["by_bash_command"].items(),
+                          key=lambda x: x[1]["count"], reverse=True)[:top_n]:
+        top_proj = max(d["by_project"].items(), key=lambda x: x[1])[0] if d["by_project"] else "-"
+        rows.append([cmd[:30], d["count"], top_proj[:25]])
+    _table(["Command", "Count", "Top Project"], rows, f"BASH COMMANDS (top {top_n})", f)
+    if bash_result:
+        avg = bash_result["total_chars"] // bash_result["count"] if bash_result["count"] else 0
+        print(f"\n  Bash overall: {bash_result['count']} calls, "
+              f"~{format_tokens(bash_result['total_chars'] // 4)} total result tokens, "
+              f"~{format_tokens(avg // 4)} avg/call, "
+              f"~{format_tokens(bash_result['max_single'] // 4)} max single result", file=f)
+
+
+def _section_heavy_sessions(stats, top_n, f):
+    items = []
+    for sid, sess in stats["sessions"].items():
+        total = sess["input_tokens"] + sess["output_tokens"]
+        if total > 0:
+            items.append((sid, sess, total))
+    items.sort(key=lambda x: x[2], reverse=True)
+
+    rows = []
+    for sid, sess, _ in items[:top_n]:
+        models = ", ".join(sorted(sess["models"]))
+        rows.append([
+            sid[:20] + "...", sess["project"][:20],
+            format_tokens(sess["input_tokens"]),
+            format_tokens(sess["output_tokens"]),
+            cache_hit_rate(sess["cache_read"], sess["cache_create"], sess["input_tokens"]),
+            sess["tool_calls"], models[:25],
+        ])
+    _table(["Session", "Project", "Uncached", "Output", "Cache Hit", "Tools", "Models"],
+           rows, f"HEAVIEST SESSIONS (top {top_n})", f)
+
+
+def _section_summary(stats, f):
+    print(f"\n{'=' * 70}", file=f)
+    print("  COST SUMMARY", file=f)
+    print(f"{'=' * 70}", file=f)
+
+    tc = sum(d["total_chars"] for d in stats["tool_result_cost"].values())
+    hc = sum(d["total_chars"] for d in stats["hook_injection_cost"].values())
+    sc = sum(d["total_chars"] for d in stats["skill_cost"].values())
+
+    print(f"\n  Context injected by tool results:    ~{format_tokens(tc // 4)} tokens", file=f)
+    print(f"  Context injected by hooks/system:    ~{format_tokens(hc // 4)} tokens", file=f)
+    print(f"  Context injected by skill loads:     ~{format_tokens(sc // 4)} tokens", file=f)
+    print("  (Note: skill loads are a subset of tool results)", file=f)
+    print(file=f)
+
+    all_costs = []
+    for tool, d in stats["tool_result_cost"].items():
+        all_costs.append((f"tool:{tool}", d["total_chars"] // 4, d["count"]))
+    for cat, d in stats["hook_injection_cost"].items():
+        all_costs.append((cat, d["total_chars"] // 4, d["count"]))
+    all_costs.sort(key=lambda x: x[1], reverse=True)
+
+    print("  TOP CONTEXT CONSUMERS (tool results + hooks combined):", file=f)
+    for name, tokens, count in all_costs[:10]:
+        print(f"    {name:45s}  ~{format_tokens(tokens):>8s} tokens  ({count} calls)", file=f)
+    print(file=f)
+
+
+# ---- Public entry point ---------------------------------------------------
+
+def write_report(stats: dict, output: str | None, top_n: int = 20):
+    """Print the full ASCII report to stdout (output arg is ignored)."""
+    f = sys.stdout
+    print("\n" + "=" * 70, file=f)
+    print("  CLAUDE CODE TOKEN COST ANALYSIS", file=f)
+    print("=" * 70, file=f)
+    print(f"  Total sessions:   {stats['total_sessions']}", file=f)
+    print(f"  Total API calls:  {stats['total_requests']}", file=f)
+    print(f"  Total tool calls: {stats['total_tool_calls']}", file=f)
+
+    _section_models(stats, top_n, f)
+    _section_projects(stats, top_n, f)
+    _section_cache_daily(stats, top_n, f)
+    _section_cache_projects(stats, top_n, f)
+    _section_worst_cache_sessions(stats, top_n, f)
+    _section_tool_cost(stats, top_n, f)
+    _section_hooks(stats, top_n, f)
+    _section_skills(stats, top_n, f)
+    _section_subagents(stats, top_n, f)
+    _section_bash(stats, top_n, f)
+    _section_heavy_sessions(stats, top_n, f)
+    _section_summary(stats, f)
+
+
+def write_daily_report(stats: dict, project_filter: str | None, top_n: int = 20):
+    """Print a focused per-day breakdown for a single project."""
+    f = sys.stdout
+
+    # Collect matching projects from daily_by_project
+    daily_data: dict[str, dict] = {}  # date -> aggregated day stats
+    matched_project = None
+
+    for dp_key, d in stats["daily_by_project"].items():
+        date, project = dp_key.split("|", 1)
+        if date == "unknown":
+            continue
+        if project_filter and project_filter.lower() not in project.lower():
+            continue
+        matched_project = project
+        if date not in daily_data:
+            daily_data[date] = {
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_read": 0, "cache_create": 0,
+                "requests": 0, "tool_calls": 0, "sessions": set(),
+            }
+        dd = daily_data[date]
+        dd["input_tokens"] += d["input_tokens"]
+        dd["output_tokens"] += d["output_tokens"]
+        dd["cache_read"] += d["cache_read"]
+        dd["cache_create"] += d["cache_create"]
+        dd["requests"] += d["requests"]
+        dd["tool_calls"] += d["tool_calls"]
+        dd["sessions"] |= d["sessions"]
+
+    if not daily_data:
+        print("No data found.", file=f)
+        if not project_filter:
+            print("Hint: use --project NAME with --daily", file=f)
+        return
+
+    label = matched_project or project_filter or "all projects"
+    print(f"\n{'=' * 80}", file=f)
+    print(f"  DAILY BREAKDOWN: {label}", file=f)
+    print(f"{'=' * 80}", file=f)
+
+    # Totals
+    total_in = sum(d["input_tokens"] for d in daily_data.values())
+    total_out = sum(d["output_tokens"] for d in daily_data.values())
+    total_cr = sum(d["cache_read"] for d in daily_data.values())
+    total_cc = sum(d["cache_create"] for d in daily_data.values())
+    total_reqs = sum(d["requests"] for d in daily_data.values())
+    total_tools = sum(d["tool_calls"] for d in daily_data.values())
+    total_sessions = len(set().union(*(d["sessions"] for d in daily_data.values())))
+
+    print(f"  Period:    {min(daily_data)} to {max(daily_data)}  ({len(daily_data)} days)", file=f)
+    print(f"  Sessions:  {total_sessions}", file=f)
+    print(f"  Requests:  {total_reqs:,}", file=f)
+    print(f"  Tools:     {total_tools:,}", file=f)
+    print(f"  Output:    {format_tokens(total_out)}", file=f)
+    print(f"  Cache hit: {cache_hit_rate(total_cr, total_cc, total_in)}", file=f)
+
+    # Main daily table
+    rows = []
+    for date in sorted(daily_data)[-top_n:]:
+        d = daily_data[date]
+        total_ctx = d["input_tokens"] + d["cache_read"] + d["cache_create"]
+        rows.append([
+            date,
+            format_tokens(d["cache_read"]),
+            format_tokens(d["cache_create"]),
+            format_tokens(d["input_tokens"]),
+            cache_hit_rate(d["cache_read"], d["cache_create"], d["input_tokens"]),
+            format_tokens(d["output_tokens"]),
+            d["requests"],
+            d["tool_calls"],
+            len(d["sessions"]),
+        ])
+    _table(
+        ["Date", "Cache Read", "Cache Create", "Uncached", "Hit Rate",
+         "Output", "Reqs", "Tools", "Sessions"],
+        rows, "DAILY USAGE & CACHE", f,
+    )
+
+    # Per-model daily breakdown for this project (from cache_by_date cross-ref)
+    # Rebuild per-model view from the global cache_by_date, filtered
+    date_model: dict[str, dict[str, dict]] = {}
+    for dm_key, d in stats["cache_by_date"].items():
+        date, model = dm_key.split("|", 1)
+        if date not in daily_data:
+            continue
+        date_model.setdefault(date, {})[model] = d
+
+    # Figure out which models are active
+    model_totals: dict[str, int] = {}
+    for date, models in date_model.items():
+        for model, d in models.items():
+            model_totals[model] = model_totals.get(model, 0) + d["requests"]
+
+    for model in sorted(model_totals, key=model_totals.get, reverse=True):
+        if model_totals[model] < 5 or model == "<synthetic>":
+            continue
+        rows = []
+        for date in sorted(date_model)[-top_n:]:
+            if model not in date_model.get(date, {}):
+                continue
+            d = date_model[date][model]
+            rows.append([
+                date,
+                format_tokens(d["cache_read"]),
+                format_tokens(d["cache_create"]),
+                format_tokens(d["input_tokens"]),
+                cache_hit_rate(d["cache_read"], d["cache_create"], d["input_tokens"]),
+                d["requests"],
+            ])
+        if rows:
+            short = (model.replace("claude-", "")
+                     .replace("-20251001", "").replace("-20251101", "")
+                     .replace("-20250929", "").replace("-20250805", "")
+                     .replace("-20250514", ""))
+            _table(
+                ["Date", "Cache Read", "Cache Create", "Uncached", "Hit Rate", "Reqs"],
+                rows, f"BY MODEL: {short}", f,
+            )
+
+    # Worst cache sessions for this project
+    all_sessions = set().union(*(d["sessions"] for d in daily_data.values()))
+    session_cache = []
+    for sid, sess in stats["sessions"].items():
+        if sid not in all_sessions:
+            continue
+        total_ctx = sess["input_tokens"] + sess["cache_read"] + sess["cache_create"]
+        if total_ctx >= 100_000:
+            hit = sess["cache_read"] / total_ctx
+            session_cache.append((sid, sess, hit))
+    session_cache.sort(key=lambda x: x[2])
+
+    if session_cache:
+        rows = []
+        for sid, sess, _ in session_cache[:top_n]:
+            rows.append([
+                sid[:20] + "...",
+                format_tokens(sess["cache_read"]),
+                format_tokens(sess["cache_create"]),
+                format_tokens(sess["input_tokens"]),
+                cache_hit_rate(sess["cache_read"], sess["cache_create"], sess["input_tokens"]),
+                sess.get("start", "")[:10] if sess.get("start") else "-",
+            ])
+        _table(
+            ["Session", "Cache Read", "Cache Create", "Uncached", "Hit Rate", "Date"],
+            rows, "SESSIONS WITH WORST CACHE HIT RATE (min 100K context)", f,
+        )
+
+    print(file=f)

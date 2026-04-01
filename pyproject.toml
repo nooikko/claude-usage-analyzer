@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "claude-usage-analyzer"
+version = "0.1.0"
+description = "Token cost attribution and cache analysis for Claude Code sessions"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Quinn Penney" }]
+keywords = ["claude", "anthropic", "token-usage", "cost-analysis"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.optional-dependencies]
+excel = ["openpyxl>=3.1"]
+
+[project.scripts]
+claude-usage = "claude_usage_analyzer.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_usage_analyzer"]
