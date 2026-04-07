@@ -11,6 +11,7 @@ from pathlib import Path
 from .parser import parse_jsonl_file
 from .utils import (
     categorize_reminder,
+    estimate_cost,
     extract_system_reminders,
     file_could_be_in_range,
     get_project_name,
@@ -50,6 +51,10 @@ def _new_stats() -> dict:
             "total_chars": 0, "count": 0, "by_project": defaultdict(int),
             "max_single": 0,
         }),
+        "tool_lifetime_cost": defaultdict(lambda: {
+            "attributed_cost": 0.0,
+            "accumulated_tok": 0,  # Σ(tool_tokens_in_ctx per API call)
+        }),
         "hook_injection_cost": defaultdict(lambda: {
             "total_chars": 0, "count": 0, "by_project": defaultdict(int),
         }),
@@ -81,6 +86,7 @@ def _new_stats() -> dict:
             "input_tokens": 0, "output_tokens": 0,
             "cache_read": 0, "cache_create": 0,
             "tool_calls": 0, "models": set(), "is_sidechain": False,
+            "total_cost": 0.0, "total_ctx_tokens": 0, "tool_attributed_cost": 0.0,
         }),
         "total_sessions": 0,
         "total_requests": 0,
@@ -186,6 +192,8 @@ def _process_agent_files(agent_files, project_name, stats, since_dt, until_dt):
 
 def _process_session_records(records, file_stem, project_name, stats):
     tool_use_map: dict[str, dict] = {}
+    tool_context_chars: dict[str, int] = {}  # tool_name -> cumulative chars currently in context
+    total_tool_chars = 0
 
     for record in records:
         rec_type = record.get("type")
@@ -205,8 +213,12 @@ def _process_session_records(records, file_stem, project_name, stats):
 
         if rec_type == "assistant":
             _handle_assistant(record, project_name, session_id, stats, tool_use_map)
+            # Accumulate lifetime cost: tool_context_chars reflects tool results from
+            # previous user records, which are the ones in context for this API call.
+            _accumulate_lifetime_cost(record, session_id, stats, tool_context_chars, total_tool_chars)
         elif rec_type == "user":
-            _handle_user(record, project_name, stats, tool_use_map)
+            new_chars = _handle_user(record, project_name, stats, tool_use_map, tool_context_chars)
+            total_tool_chars += new_chars
 
 
 def _handle_assistant(record, project_name, session_id, stats, tool_use_map):
@@ -302,17 +314,28 @@ def _handle_assistant(record, project_name, session_id, stats, tool_use_map):
         stats["daily_by_project"][f"{date_key}|{project_name}"]["tool_calls"] += 1
 
 
-def _handle_user(record, project_name, stats, tool_use_map):
+def _handle_user(record, project_name, stats, tool_use_map, tool_context_chars=None):
+    """Process a user record. Updates tool_context_chars in-place if provided.
+
+    Returns the total new chars added to context from tool results in this record.
+    """
     content = record.get("message", {}).get("content", [])
     if not isinstance(content, list):
-        return
+        return 0
 
+    new_chars = 0
     for block in content:
         if not isinstance(block, dict):
             continue
 
         if block.get("type") == "tool_result":
-            _attribute_tool_result(block, project_name, stats, tool_use_map)
+            size = _attribute_tool_result(block, project_name, stats, tool_use_map)
+            if size and tool_context_chars is not None:
+                tool_id = block.get("tool_use_id", "")
+                tool_info = tool_use_map.get(tool_id, {})
+                tool_name = tool_info.get("name", "unknown")
+                tool_context_chars[tool_name] = tool_context_chars.get(tool_name, 0) + size
+                new_chars += size
         elif block.get("type") == "text":
             text = block.get("text", "")
             _, reminders = extract_system_reminders(text)
@@ -321,6 +344,48 @@ def _handle_user(record, project_name, stats, tool_use_map):
                 stats["hook_injection_cost"][cat]["total_chars"] += len(rem)
                 stats["hook_injection_cost"][cat]["count"] += 1
                 stats["hook_injection_cost"][cat]["by_project"][project_name] += len(rem)
+
+    return new_chars
+
+
+def _accumulate_lifetime_cost(record, session_id, stats, tool_context_chars, total_tool_chars):
+    """Attribute the cost of an assistant API call to tools currently in context."""
+    msg = record.get("message", {})
+    model = msg.get("model", "unknown")
+    usage = msg.get("usage", {})
+
+    inp = usage.get("input_tokens", 0)
+    out = usage.get("output_tokens", 0)
+    cr = usage.get("cache_read_input_tokens", 0)
+    cc = usage.get("cache_creation_input_tokens", 0)
+
+    call_cost = estimate_cost(model, inp, out, cr, cc)
+    if call_cost is None:
+        return
+
+    total_ctx = inp + cr + cc
+    sess = stats["sessions"][session_id]
+    sess["total_cost"] += call_cost
+    sess["total_ctx_tokens"] += total_ctx
+
+    if total_tool_chars <= 0 or total_ctx <= 0:
+        return
+
+    tool_tokens_est = total_tool_chars / 4
+    tool_fraction = min(tool_tokens_est / total_ctx, 1.0)
+    tool_attributed = call_cost * tool_fraction
+    sess["tool_attributed_cost"] += tool_attributed
+
+    for tool_name, tool_chars in tool_context_chars.items():
+        if tool_chars <= 0:
+            continue
+        share = tool_chars / total_tool_chars
+        attributed = tool_attributed * share
+        tok_burden = tool_chars // 4
+
+        tl = stats["tool_lifetime_cost"][tool_name]
+        tl["attributed_cost"] += attributed
+        tl["accumulated_tok"] += tok_burden
 
 
 def _attribute_tool_result(block, project_name, stats, tool_use_map):
@@ -368,3 +433,5 @@ def _attribute_tool_result(block, project_name, stats, tool_use_map):
             stats["subagent_cost"][sa_key]["descriptions"].append(
                 tool_info["description"][:60]
             )
+
+    return tool_content_size

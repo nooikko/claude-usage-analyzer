@@ -263,6 +263,59 @@ def _section_tool_cost(stats, top_n, f):
            rows, f"TOOL RESULT COST BY PROJECT (top {top_n})", f)
 
 
+def _section_tool_lifetime_cost(stats, top_n, f):
+    """Show per-tool cost attribution based on how long results persist in context."""
+    tool_lifetime = stats.get("tool_lifetime_cost", {})
+    tool_result = stats.get("tool_result_cost", {})
+    if not tool_lifetime:
+        return
+
+    # Total actual cost across all models
+    total_actual_cost = 0.0
+    for model, d in stats["by_model"].items():
+        c = estimate_cost(model, d["input_tokens"], d["output_tokens"], d["cache_read"], d["cache_create"])
+        if c is not None:
+            total_actual_cost += c
+
+    rows = []
+    for tool, tl in sorted(tool_lifetime.items(),
+                            key=lambda x: x[1]["attributed_cost"], reverse=True)[:top_n]:
+        attributed = tl["attributed_cost"]
+        accumulated_tok = tl["accumulated_tok"]
+
+        tr = tool_result.get(tool, {})
+        injections = tr.get("count", 0)
+        total_chars = tr.get("total_chars", 0)
+
+        # Avg size in tokens per injection
+        avg_tok = (total_chars // 4 // injections) if injections else 0
+
+        # Avg turns in context: accumulated_tok / (total_chars // 4)
+        total_tok = total_chars // 4
+        avg_turns = (accumulated_tok / total_tok) if total_tok else 0.0
+
+        pct = (attributed / total_actual_cost * 100) if total_actual_cost else 0.0
+
+        rows.append([
+            tool,
+            f"{injections:,}",
+            format_tokens(avg_tok),
+            f"{avg_turns:.1f}",
+            format_tokens(accumulated_tok),
+            format_cost(attributed),
+            f"{pct:.1f}%",
+        ])
+
+    _table(
+        ["Tool", "Injections", "Avg Size", "Avg Turns in Context", "Accumulated Tok",
+         "Attributed Cost", "% of Bill"],
+        rows,
+        f"TOOL CONTEXT LIFETIME COST ATTRIBUTION (top {top_n})\n"
+        "  How much of the actual API bill is attributable to each tool's results sitting in context",
+        f,
+    )
+
+
 def _section_hooks(stats, top_n, f):
     if not stats["hook_injection_cost"]:
         return
@@ -358,12 +411,14 @@ def _section_heavy_sessions(stats, top_n, f):
     rows = []
     for sid, sess, _ in items[:top_n]:
         models = ", ".join(sorted(sess["models"]))
+        total_cost = sess.get("total_cost", 0.0)
+        cost = total_cost if total_cost > 0 else _session_cost(sess)
         rows.append([
             sid[:20] + "...", sess["project"][:20],
             format_tokens(sess["input_tokens"]),
             format_tokens(sess["output_tokens"]),
             cache_hit_rate(sess["cache_read"], sess["cache_create"], sess["input_tokens"]),
-            format_cost(_session_cost(sess)),
+            format_cost(cost),
             sess["tool_calls"], models[:25],
         ])
     _table(["Session", "Project", "Uncached", "Output", "Cache Hit", "Est Cost", "Tools", "Models"],
@@ -449,6 +504,7 @@ def write_report(stats: dict, output: str | None, top_n: int = 20):
     _section_cache_projects(stats, top_n, f)
     _section_worst_cache_sessions(stats, top_n, f)
     _section_tool_cost(stats, top_n, f)
+    _section_tool_lifetime_cost(stats, top_n, f)
     _section_hooks(stats, top_n, f)
     _section_skills(stats, top_n, f)
     _section_subagents(stats, top_n, f)
