@@ -27,7 +27,10 @@ def _new_stats() -> dict:
     return {
         "by_model": defaultdict(lambda: {
             "input_tokens": 0, "output_tokens": 0,
-            "cache_read": 0, "cache_create": 0, "requests": 0,
+            "cache_read": 0, "cache_create": 0,
+            "cache_create_5m": 0, "cache_create_1h": 0,
+            "thinking_tokens": 0, "text_tokens": 0,
+            "requests": 0,
         }),
         "by_project": defaultdict(lambda: {
             "input_tokens": 0, "output_tokens": 0, "requests": 0,
@@ -232,6 +235,32 @@ def _handle_assistant(record, project_name, session_id, stats, tool_use_map):
     cache_read = usage.get("cache_read_input_tokens", 0)
     cache_create = usage.get("cache_creation_input_tokens", 0)
 
+    # 5m / 1h cache tier split (available in newer JSONL format)
+    cc_tiers = usage.get("cache_creation", {})
+    cache_create_5m = cc_tiers.get("ephemeral_5m_input_tokens", 0)
+    cache_create_1h = cc_tiers.get("ephemeral_1h_input_tokens", 0)
+
+    # Split output_tokens into thinking / text-to-user / tool-use by measuring
+    # the character sizes of each content block type, then proportioning.
+    thinking_chars = text_chars = tool_chars = 0
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            t = block.get("type")
+            if t == "thinking":
+                thinking_chars += len(block.get("thinking", ""))
+            elif t == "text":
+                text_chars += len(block.get("text", ""))
+            elif t == "tool_use":
+                tool_chars += len(json.dumps(block.get("input", {})))
+    total_out_chars = thinking_chars + text_chars + tool_chars
+    if total_out_chars > 0 and output_tokens > 0:
+        thinking_tokens = int(output_tokens * thinking_chars / total_out_chars)
+        text_tokens = int(output_tokens * text_chars / total_out_chars)
+    else:
+        thinking_tokens = text_tokens = 0
+
     # Aggregate into all the relevant buckets
     for bucket in (
         stats["by_model"][model],
@@ -243,6 +272,12 @@ def _handle_assistant(record, project_name, session_id, stats, tool_use_map):
         bucket["cache_read"] += cache_read
         bucket["cache_create"] += cache_create
         bucket["requests"] += 1
+
+    # Thinking / text breakdown only on by_model (where we report it)
+    stats["by_model"][model]["thinking_tokens"] += thinking_tokens
+    stats["by_model"][model]["text_tokens"] += text_tokens
+    stats["by_model"][model]["cache_create_5m"] += cache_create_5m
+    stats["by_model"][model]["cache_create_1h"] += cache_create_1h
 
     # Cache-by-date
     ts_str = record.get("timestamp", "")

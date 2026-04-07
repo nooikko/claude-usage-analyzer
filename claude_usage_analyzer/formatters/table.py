@@ -6,7 +6,7 @@ import sys
 
 from ..utils import (
     cache_hit_rate, estimate_cost, estimate_cost_no_cache,
-    format_cost, format_tokens,
+    format_cost, format_tokens, get_pricing,
 )
 
 
@@ -430,24 +430,38 @@ def _section_summary(stats, f):
     print("  COST SUMMARY", file=f)
     print(f"{'=' * 70}", file=f)
 
-    # Dollar cost totals across all models
+    # Dollar cost totals across all models, with output broken into thinking vs text-to-user
     total_cost = 0.0
     total_no_cache = 0.0
+    total_thinking_cost = 0.0
+    total_text_cost = 0.0
     has_cost = False
+
     for model, d in stats["by_model"].items():
-        c = estimate_cost(model, d["input_tokens"], d["output_tokens"], d["cache_read"], d["cache_create"])
+        rates = get_pricing(model)
+        c = estimate_cost(model, d["input_tokens"], d["output_tokens"], d["cache_read"], d["cache_create"],
+                          d.get("cache_create_5m", 0), d.get("cache_create_1h", 0))
         nc = estimate_cost_no_cache(model, d["input_tokens"], d["output_tokens"], d["cache_read"], d["cache_create"])
         if c is not None:
             total_cost += c
             has_cost = True
         if nc is not None:
             total_no_cache += nc
+        # Thinking and text-to-user output cost
+        if rates:
+            M = 1_000_000
+            total_thinking_cost += d.get("thinking_tokens", 0) * rates["output"] / M
+            total_text_cost += d.get("text_tokens", 0) * rates["output"] / M
 
     if has_cost:
         savings = total_no_cache - total_cost
+        tool_out_cost = total_cost - total_thinking_cost - total_text_cost  # remainder = input + cache + tool calls
         print(f"\n  Estimated API cost (with cache):     {format_cost(total_cost)}", file=f)
         print(f"  Cost without caching (hypothetical): {format_cost(total_no_cache)}", file=f)
         print(f"  Cache savings:                       {format_cost(savings)}", file=f)
+        print(f"\n  Output cost breakdown:", file=f)
+        print(f"    Thinking tokens:                   {format_cost(total_thinking_cost)}", file=f)
+        print(f"    Text responses to user:            {format_cost(total_text_cost)}", file=f)
 
     tc = sum(d["total_chars"] for d in stats["tool_result_cost"].values())
     hc = sum(d["total_chars"] for d in stats["hook_injection_cost"].values())

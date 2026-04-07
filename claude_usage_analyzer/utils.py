@@ -20,41 +20,41 @@ _PRICING: list[tuple[str, dict]] = [
     # Opus 4.6 / 4.5 — new pricing (longer prefixes must come before shorter ones)
     ("claude-opus-4-6", {
         "input": 5.00, "output": 25.00,
-        "cache_create": 6.25, "cache_read": 0.50,
+        "cache_create": 6.25, "cache_create_1h": 10.00, "cache_read": 0.50,
     }),
     ("claude-opus-4-5", {
         "input": 5.00, "output": 25.00,
-        "cache_create": 6.25, "cache_read": 0.50,
+        "cache_create": 6.25, "cache_create_1h": 10.00, "cache_read": 0.50,
     }),
     # Opus 4.1 / 4.0 — original pricing
     ("claude-opus-4", {
         "input": 15.00, "output": 75.00,
-        "cache_create": 18.75, "cache_read": 1.50,
+        "cache_create": 18.75, "cache_create_1h": 30.00, "cache_read": 1.50,
     }),
     # Sonnet 4.x (all tiers same price)
     ("claude-sonnet-4", {
         "input": 3.00, "output": 15.00,
-        "cache_create": 3.75, "cache_read": 0.30,
+        "cache_create": 3.75, "cache_create_1h": 6.00, "cache_read": 0.30,
     }),
     # Haiku 4.5
     ("claude-haiku-4-5", {
         "input": 1.00, "output": 5.00,
-        "cache_create": 1.25, "cache_read": 0.10,
+        "cache_create": 1.25, "cache_create_1h": 2.00, "cache_read": 0.10,
     }),
     # Haiku 3.5
     ("claude-haiku-3-5", {
         "input": 0.80, "output": 4.00,
-        "cache_create": 1.00, "cache_read": 0.08,
+        "cache_create": 1.00, "cache_create_1h": 1.60, "cache_read": 0.08,
     }),
     # Haiku 3
     ("claude-haiku-3", {
         "input": 0.25, "output": 1.25,
-        "cache_create": 0.30, "cache_read": 0.03,
+        "cache_create": 0.30, "cache_create_1h": 0.50, "cache_read": 0.03,
     }),
     # fallback — sonnet pricing
     ("claude-", {
         "input": 3.00, "output": 15.00,
-        "cache_create": 3.75, "cache_read": 0.30,
+        "cache_create": 3.75, "cache_create_1h": 6.00, "cache_read": 0.30,
     }),
 ]
 
@@ -73,17 +73,32 @@ def estimate_cost(
     output_tokens: int,
     cache_read: int,
     cache_create: int,
+    cache_create_5m: int = 0,
+    cache_create_1h: int = 0,
 ) -> float | None:
-    """Return estimated dollar cost, or None for unknown models."""
+    """Return estimated dollar cost, or None for unknown models.
+
+    If cache_create_5m / cache_create_1h are provided they are used for
+    accurate tier-split pricing; otherwise cache_create is billed at the
+    5-minute rate (the cheaper tier).
+    """
     rates = get_pricing(model)
     if rates is None:
         return None
     M = 1_000_000
+    # Use tier-split cache pricing when available
+    if cache_create_5m or cache_create_1h:
+        cc_cost = (
+            cache_create_5m * rates["cache_create"]    / M
+            + cache_create_1h * rates.get("cache_create_1h", rates["cache_create"] * 1.6) / M
+        )
+    else:
+        cc_cost = cache_create * rates["cache_create"] / M
     return (
-        input_tokens  * rates["input"]        / M
-        + output_tokens * rates["output"]       / M
-        + cache_create  * rates["cache_create"] / M
-        + cache_read    * rates["cache_read"]   / M
+        input_tokens  * rates["input"]   / M
+        + output_tokens * rates["output"]  / M
+        + cc_cost
+        + cache_read    * rates["cache_read"] / M
     )
 
 
