@@ -17,19 +17,41 @@ logger = logging.getLogger(__name__)
 
 # Keys are model-name prefixes; longest match wins.
 _PRICING: list[tuple[str, dict]] = [
+    # Opus 4.6 / 4.5 — new pricing (longer prefixes must come before shorter ones)
+    ("claude-opus-4-6", {
+        "input": 5.00, "output": 25.00,
+        "cache_create": 6.25, "cache_read": 0.50,
+    }),
+    ("claude-opus-4-5", {
+        "input": 5.00, "output": 25.00,
+        "cache_create": 6.25, "cache_read": 0.50,
+    }),
+    # Opus 4.1 / 4.0 — original pricing
     ("claude-opus-4", {
         "input": 15.00, "output": 75.00,
         "cache_create": 18.75, "cache_read": 1.50,
     }),
+    # Sonnet 4.x (all tiers same price)
     ("claude-sonnet-4", {
         "input": 3.00, "output": 15.00,
         "cache_create": 3.75, "cache_read": 0.30,
     }),
-    ("claude-haiku-4", {
+    # Haiku 4.5
+    ("claude-haiku-4-5", {
+        "input": 1.00, "output": 5.00,
+        "cache_create": 1.25, "cache_read": 0.10,
+    }),
+    # Haiku 3.5
+    ("claude-haiku-3-5", {
         "input": 0.80, "output": 4.00,
         "cache_create": 1.00, "cache_read": 0.08,
     }),
-    # fallback
+    # Haiku 3
+    ("claude-haiku-3", {
+        "input": 0.25, "output": 1.25,
+        "cache_create": 0.30, "cache_read": 0.03,
+    }),
+    # fallback — sonnet pricing
     ("claude-", {
         "input": 3.00, "output": 15.00,
         "cache_create": 3.75, "cache_read": 0.30,
