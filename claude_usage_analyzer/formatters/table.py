@@ -173,6 +173,16 @@ def _section_cache_projects(stats, top_n, f):
            rows, f"CACHE HIT RATE BY PROJECT (top {top_n})", f)
 
 
+def _session_cost(sess) -> float | None:
+    """Estimate cost for a session using its primary model."""
+    models = sess.get("models") or set()
+    model = sorted(models)[0] if models else None
+    if not model or model == "<synthetic>":
+        return None
+    return estimate_cost(model, sess["input_tokens"], sess["output_tokens"],
+                         sess["cache_read"], sess["cache_create"])
+
+
 def _section_worst_cache_sessions(stats, top_n, f):
     items = []
     for sid, sess in stats["sessions"].items():
@@ -190,27 +200,45 @@ def _section_worst_cache_sessions(stats, top_n, f):
             format_tokens(sess["cache_create"]),
             format_tokens(sess["input_tokens"]),
             cache_hit_rate(sess["cache_read"], sess["cache_create"], sess["input_tokens"]),
+            format_cost(_session_cost(sess)),
             sess.get("start", "")[:10] if sess.get("start") else "-",
         ])
     if rows:
-        _table(["Session", "Project", "Cache Read", "Cache Create", "Uncached", "Hit Rate", "Date"],
+        _table(["Session", "Project", "Cache Read", "Cache Create", "Uncached", "Hit Rate", "Est Cost", "Date"],
                rows, "SESSIONS WITH WORST CACHE HIT RATE (min 100K context)", f)
 
 
+def _blended_input_rate(stats) -> float:
+    """Compute blended cost per input token across all models ($/token)."""
+    total_cost = 0.0
+    total_tokens = 0
+    for model, d in stats["by_model"].items():
+        c = estimate_cost(model, d["input_tokens"], d["output_tokens"], d["cache_read"], d["cache_create"])
+        if c is not None:
+            total_cost += c
+            total_tokens += d["input_tokens"] + d["cache_read"] + d["cache_create"]
+    return (total_cost / total_tokens) if total_tokens else 0.0
+
+
 def _section_tool_cost(stats, top_n, f):
+    rate = _blended_input_rate(stats)  # $/token
+
     rows = []
     for tool, d in sorted(stats["tool_result_cost"].items(),
                            key=lambda x: x[1]["total_chars"], reverse=True)[:top_n]:
         avg = d["total_chars"] // d["count"] if d["count"] else 0
         top_proj = max(d["by_project"].items(), key=lambda x: x[1])[0] if d["by_project"] else "-"
+        tool_tokens = d["total_chars"] // 4
+        tool_cost = tool_tokens * rate if rate else None
         rows.append([
             tool, d["count"],
-            format_tokens(d["total_chars"] // 4),
+            format_tokens(tool_tokens),
             format_tokens(avg // 4),
             format_tokens(d["max_single"] // 4),
+            format_cost(tool_cost) if tool_cost else "-",
             top_proj[:25],
         ])
-    _table(["Tool", "Calls", "Total Est Tok", "Avg/Call", "Max Single", "Top Project"],
+    _table(["Tool", "Calls", "Total Est Tok", "Avg/Call", "Max Single", "Est Cost", "Top Project"],
            rows, f"TOOL RESULT CONTEXT COST (top {top_n})\n  How much context each tool's results inject", f)
 
     raw = []
@@ -323,9 +351,10 @@ def _section_heavy_sessions(stats, top_n, f):
             format_tokens(sess["input_tokens"]),
             format_tokens(sess["output_tokens"]),
             cache_hit_rate(sess["cache_read"], sess["cache_create"], sess["input_tokens"]),
+            format_cost(_session_cost(sess)),
             sess["tool_calls"], models[:25],
         ])
-    _table(["Session", "Project", "Uncached", "Output", "Cache Hit", "Tools", "Models"],
+    _table(["Session", "Project", "Uncached", "Output", "Cache Hit", "Est Cost", "Tools", "Models"],
            rows, f"HEAVIEST SESSIONS (top {top_n})", f)
 
 
