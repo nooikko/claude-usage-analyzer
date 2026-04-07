@@ -11,6 +11,93 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Pricing  (dollars per million tokens)
+# Source: https://www.anthropic.com/pricing  — update as models change
+# ---------------------------------------------------------------------------
+
+# Keys are model-name prefixes; longest match wins.
+_PRICING: list[tuple[str, dict]] = [
+    ("claude-opus-4", {
+        "input": 15.00, "output": 75.00,
+        "cache_create": 18.75, "cache_read": 1.50,
+    }),
+    ("claude-sonnet-4", {
+        "input": 3.00, "output": 15.00,
+        "cache_create": 3.75, "cache_read": 0.30,
+    }),
+    ("claude-haiku-4", {
+        "input": 0.80, "output": 4.00,
+        "cache_create": 1.00, "cache_read": 0.08,
+    }),
+    # fallback
+    ("claude-", {
+        "input": 3.00, "output": 15.00,
+        "cache_create": 3.75, "cache_read": 0.30,
+    }),
+]
+
+
+def get_pricing(model: str) -> dict | None:
+    """Return the pricing dict for *model*, or None if unrecognised."""
+    for prefix, rates in _PRICING:
+        if model.startswith(prefix):
+            return rates
+    return None
+
+
+def estimate_cost(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read: int,
+    cache_create: int,
+) -> float | None:
+    """Return estimated dollar cost, or None for unknown models."""
+    rates = get_pricing(model)
+    if rates is None:
+        return None
+    M = 1_000_000
+    return (
+        input_tokens  * rates["input"]        / M
+        + output_tokens * rates["output"]       / M
+        + cache_create  * rates["cache_create"] / M
+        + cache_read    * rates["cache_read"]   / M
+    )
+
+
+def estimate_cost_no_cache(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read: int,
+    cache_create: int,
+) -> float | None:
+    """What the cost would have been with zero cache (all tokens billed as input)."""
+    rates = get_pricing(model)
+    if rates is None:
+        return None
+    M = 1_000_000
+    total_input = input_tokens + cache_read + cache_create
+    return (
+        total_input    * rates["input"]  / M
+        + output_tokens * rates["output"] / M
+    )
+
+
+def format_cost(usd: float | None) -> str:
+    """Format a dollar amount compactly."""
+    if usd is None:
+        return "-"
+    if usd >= 1000:
+        return f"${usd:,.0f}"
+    if usd >= 1:
+        return f"${usd:.2f}"
+    if usd >= 0.01:
+        return f"${usd:.3f}"
+    return f"${usd:.4f}"
+
+
+# ---------------------------------------------------------------------------
 # Token / number formatting
 # ---------------------------------------------------------------------------
 

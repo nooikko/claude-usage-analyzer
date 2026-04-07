@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import sys
 
-from ..utils import cache_hit_rate, format_tokens
+from ..utils import (
+    cache_hit_rate, estimate_cost, estimate_cost_no_cache,
+    format_cost, format_tokens,
+)
 
 
 def _table(headers, rows, title="", file=sys.stdout):
@@ -36,6 +39,9 @@ def _section_models(stats, top_n, f):
     for model, d in sorted(stats["by_model"].items(),
                             key=lambda x: x[1]["cache_read"] + x[1]["cache_create"] + x[1]["input_tokens"],
                             reverse=True):
+        cost = estimate_cost(model, d["input_tokens"], d["output_tokens"], d["cache_read"], d["cache_create"])
+        no_cache_cost = estimate_cost_no_cache(model, d["input_tokens"], d["output_tokens"], d["cache_read"], d["cache_create"])
+        savings = (no_cache_cost - cost) if (cost is not None and no_cache_cost is not None) else None
         rows.append([
             model,
             format_tokens(d["input_tokens"]),
@@ -43,25 +49,48 @@ def _section_models(stats, top_n, f):
             format_tokens(d["cache_create"]),
             cache_hit_rate(d["cache_read"], d["cache_create"], d["input_tokens"]),
             format_tokens(d["output_tokens"]),
+            format_cost(cost),
+            format_cost(savings),
             d["requests"],
         ])
-    _table(["Model", "Uncached", "Cache Read", "Cache Create", "Hit Rate", "Output", "Reqs"],
+    _table(["Model", "Uncached", "Cache Read", "Cache Create", "Hit Rate", "Output", "Est Cost", "Cache Savings", "Reqs"],
            rows, "TOKEN USAGE BY MODEL", f)
 
 
+def _project_costs(stats) -> dict[str, tuple[float, float]]:
+    """Return {project: (actual_cost, no_cache_cost)} summed across models."""
+    costs: dict[str, list] = {}
+    for pm_key, d in stats["by_project_model"].items():
+        proj, model = pm_key.split("|", 1)
+        cost = estimate_cost(model, d["input_tokens"], d["output_tokens"], d["cache_read"], d["cache_create"])
+        no_cache = estimate_cost_no_cache(model, d["input_tokens"], d["output_tokens"], d["cache_read"], d["cache_create"])
+        if proj not in costs:
+            costs[proj] = [0.0, 0.0]
+        if cost is not None:
+            costs[proj][0] += cost
+        if no_cache is not None:
+            costs[proj][1] += no_cache
+    return {p: (v[0], v[1]) for p, v in costs.items()}
+
+
 def _section_projects(stats, top_n, f):
+    proj_costs = _project_costs(stats)
     rows = []
     for proj, d in sorted(stats["by_project"].items(),
                            key=lambda x: x[1]["output_tokens"], reverse=True)[:top_n]:
+        cost, no_cache = proj_costs.get(proj, (None, None))
+        savings = (no_cache - cost) if (cost is not None and no_cache is not None) else None
         rows.append([
             proj[:35],
             format_tokens(d["input_tokens"]),
             format_tokens(d["cache_read"]),
             cache_hit_rate(d["cache_read"], d["cache_create"], d["input_tokens"]),
             format_tokens(d["output_tokens"]),
+            format_cost(cost),
+            format_cost(savings),
             d["requests"], d["sessions"], d["tool_calls"],
         ])
-    _table(["Project", "Uncached", "Cache Read", "Hit Rate", "Output", "Reqs", "Sessions", "Tools"],
+    _table(["Project", "Uncached", "Cache Read", "Hit Rate", "Output", "Est Cost", "Cache Savings", "Reqs", "Sessions", "Tools"],
            rows, f"TOKEN USAGE BY PROJECT (top {top_n})", f)
 
 
@@ -305,6 +334,25 @@ def _section_summary(stats, f):
     print("  COST SUMMARY", file=f)
     print(f"{'=' * 70}", file=f)
 
+    # Dollar cost totals across all models
+    total_cost = 0.0
+    total_no_cache = 0.0
+    has_cost = False
+    for model, d in stats["by_model"].items():
+        c = estimate_cost(model, d["input_tokens"], d["output_tokens"], d["cache_read"], d["cache_create"])
+        nc = estimate_cost_no_cache(model, d["input_tokens"], d["output_tokens"], d["cache_read"], d["cache_create"])
+        if c is not None:
+            total_cost += c
+            has_cost = True
+        if nc is not None:
+            total_no_cache += nc
+
+    if has_cost:
+        savings = total_no_cache - total_cost
+        print(f"\n  Estimated API cost (with cache):     {format_cost(total_cost)}", file=f)
+        print(f"  Cost without caching (hypothetical): {format_cost(total_no_cache)}", file=f)
+        print(f"  Cache savings:                       {format_cost(savings)}", file=f)
+
     tc = sum(d["total_chars"] for d in stats["tool_result_cost"].values())
     hc = sum(d["total_chars"] for d in stats["hook_injection_cost"].values())
     sc = sum(d["total_chars"] for d in stats["skill_cost"].values())
@@ -404,12 +452,27 @@ def write_daily_report(stats: dict, project_filter: str | None, top_n: int = 20)
     total_tools = sum(d["tool_calls"] for d in daily_data.values())
     total_sessions = len(set().union(*(d["sessions"] for d in daily_data.values())))
 
+    # Cost for matched project(s) across all models
+    proj_costs = _project_costs(stats)
+    matched_proj_names = set()
+    for dp_key in stats["daily_by_project"]:
+        date, project = dp_key.split("|", 1)
+        if project_filter and project_filter.lower() not in project.lower():
+            continue
+        matched_proj_names.add(project)
+
+    proj_total_cost = sum(proj_costs.get(p, (0.0, 0.0))[0] for p in matched_proj_names)
+    proj_no_cache = sum(proj_costs.get(p, (0.0, 0.0))[1] for p in matched_proj_names)
+    proj_savings = proj_no_cache - proj_total_cost
+
     print(f"  Period:    {min(daily_data)} to {max(daily_data)}  ({len(daily_data)} days)", file=f)
     print(f"  Sessions:  {total_sessions}", file=f)
     print(f"  Requests:  {total_reqs:,}", file=f)
     print(f"  Tools:     {total_tools:,}", file=f)
     print(f"  Output:    {format_tokens(total_out)}", file=f)
     print(f"  Cache hit: {cache_hit_rate(total_cr, total_cc, total_in)}", file=f)
+    if proj_total_cost:
+        print(f"  Est cost:  {format_cost(proj_total_cost)}  (cache saved ~{format_cost(proj_savings)})", file=f)
 
     # Main daily table
     rows = []
