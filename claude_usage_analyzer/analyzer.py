@@ -56,7 +56,9 @@ def _new_stats() -> dict:
         }),
         "tool_lifetime_cost": defaultdict(lambda: {
             "attributed_cost": 0.0,
-            "accumulated_tok": 0,  # Σ(tool_tokens_in_ctx per API call)
+            "accumulated_tok": 0,     # Σ(tokens_in_ctx per API call)
+            "injection_count": 0,     # number of times content was added to context
+            "injected_chars": 0,      # total chars ever injected
         }),
         "hook_injection_cost": defaultdict(lambda: {
             "total_chars": 0, "count": 0, "by_project": defaultdict(int),
@@ -216,9 +218,25 @@ def _process_session_records(records, file_stem, project_name, stats):
 
         if rec_type == "assistant":
             _handle_assistant(record, project_name, session_id, stats, tool_use_map)
-            # Accumulate lifetime cost: tool_context_chars reflects tool results from
-            # previous user records, which are the ones in context for this API call.
+            # Attribute cost BEFORE adding this turn's output to context —
+            # thinking/text from this turn aren't in context until the NEXT call.
             _accumulate_lifetime_cost(record, session_id, stats, tool_context_chars, total_tool_chars)
+            # Now add this turn's thinking and text output to context for subsequent turns.
+            msg = record.get("message", {})
+            for block in (msg.get("content", []) or []):
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "thinking":
+                    key, chars = "<thinking>", len(block.get("thinking", ""))
+                elif btype == "text":
+                    key, chars = "<text-response>", len(block.get("text", ""))
+                else:
+                    continue
+                tool_context_chars[key] = tool_context_chars.get(key, 0) + chars
+                stats["tool_lifetime_cost"][key]["injection_count"] += 1
+                stats["tool_lifetime_cost"][key]["injected_chars"] += chars
+                total_tool_chars += chars
         elif rec_type == "user":
             new_chars = _handle_user(record, project_name, stats, tool_use_map, tool_context_chars)
             total_tool_chars += new_chars
@@ -370,6 +388,9 @@ def _handle_user(record, project_name, stats, tool_use_map, tool_context_chars=N
                 tool_info = tool_use_map.get(tool_id, {})
                 tool_name = tool_info.get("name", "unknown")
                 tool_context_chars[tool_name] = tool_context_chars.get(tool_name, 0) + size
+                ltc = stats["tool_lifetime_cost"][tool_name]
+                ltc["injection_count"] += 1
+                ltc["injected_chars"] += size
                 new_chars += size
         elif block.get("type") == "text":
             text = block.get("text", "")

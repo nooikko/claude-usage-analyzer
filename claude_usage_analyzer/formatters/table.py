@@ -282,18 +282,12 @@ def _section_tool_lifetime_cost(stats, top_n, f):
                             key=lambda x: x[1]["attributed_cost"], reverse=True)[:top_n]:
         attributed = tl["attributed_cost"]
         accumulated_tok = tl["accumulated_tok"]
+        injections = tl.get("injection_count", 0)
+        injected_chars = tl.get("injected_chars", 0)
 
-        tr = tool_result.get(tool, {})
-        injections = tr.get("count", 0)
-        total_chars = tr.get("total_chars", 0)
-
-        # Avg size in tokens per injection
-        avg_tok = (total_chars // 4 // injections) if injections else 0
-
-        # Avg turns in context: accumulated_tok / (total_chars // 4)
-        total_tok = total_chars // 4
+        avg_tok = (injected_chars // 4 // injections) if injections else 0
+        total_tok = injected_chars // 4
         avg_turns = (accumulated_tok / total_tok) if total_tok else 0.0
-
         pct = (attributed / total_actual_cost * 100) if total_actual_cost else 0.0
 
         rows.append([
