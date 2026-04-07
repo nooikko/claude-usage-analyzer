@@ -402,18 +402,32 @@ def _section_summary(stats, f):
     print(f"  Context injected by hooks/system:    ~{format_tokens(hc // 4)} tokens", file=f)
     print(f"  Context injected by skill loads:     ~{format_tokens(sc // 4)} tokens", file=f)
     print("  (Note: skill loads are a subset of tool results)", file=f)
-    print(file=f)
 
-    all_costs = []
+    # Per-tool cost attribution using the blended rate.
+    # The blended rate (total_cost / total_context_tokens) already reflects your
+    # actual cache hit pattern, so multiplying tool injection tokens by it gives
+    # a fair estimate of what each tool contributes to the bill.
+    rate = _blended_input_rate(stats)  # $/token
+    entries = []
     for tool, d in stats["tool_result_cost"].items():
-        all_costs.append((f"tool:{tool}", d["total_chars"] // 4, d["count"]))
+        tok = d["total_chars"] // 4
+        entries.append(("tool:" + tool, d["count"], tok, tok * rate if rate else None))
     for cat, d in stats["hook_injection_cost"].items():
-        all_costs.append((cat, d["total_chars"] // 4, d["count"]))
-    all_costs.sort(key=lambda x: x[1], reverse=True)
+        tok = d["total_chars"] // 4
+        entries.append((cat, d["count"], tok, tok * rate if rate else None))
+    entries.sort(key=lambda x: x[2], reverse=True)
 
-    print("  TOP CONTEXT CONSUMERS (tool results + hooks combined):", file=f)
-    for name, tokens, count in all_costs[:10]:
-        print(f"    {name:45s}  ~{format_tokens(tokens):>8s} tokens  ({count} calls)", file=f)
+    rows = [
+        (name[:50], count, format_tokens(tok), format_cost(cost))
+        for name, count, tok, cost in entries[:20]
+    ]
+    _table(
+        ["Source", "Calls", "Est Tokens Injected", "Est Cost Attribution"],
+        rows,
+        "CONTEXT COST ATTRIBUTION BY SOURCE\n"
+        "  Cost attribution uses blended $/token rate (reflects your actual cache hit pattern)",
+        f,
+    )
     print(file=f)
 
 
