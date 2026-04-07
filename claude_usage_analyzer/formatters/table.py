@@ -111,6 +111,15 @@ def _section_cache_daily(stats, top_n, f):
             "requests": sum(m["requests"] for m in models.values()),
         }
 
+    # Pre-compute cost per date by summing across models
+    date_cost: dict[str, float] = {}
+    for date, models in date_model_data.items():
+        c = sum(
+            estimate_cost(m, d["input_tokens"], d.get("output_tokens", 0), d["cache_read"], d["cache_create"]) or 0.0
+            for m, d in models.items()
+        )
+        date_cost[date] = c
+
     rows = []
     for date in sorted(daily)[-top_n:]:
         d = daily[date]
@@ -123,8 +132,9 @@ def _section_cache_daily(stats, top_n, f):
             format_tokens(d["input_tokens"]),
             cache_hit_rate(d["cache_read"], d["cache_create"], d["input_tokens"]),
             miss, d["requests"],
+            format_cost(date_cost.get(date)),
         ])
-    _table(["Date", "Cache Read", "Cache Create", "Uncached", "Hit Rate", "Miss Rate", "Reqs"],
+    _table(["Date", "Cache Read", "Cache Create", "Uncached", "Hit Rate", "Miss Rate", "Reqs", "Est Cost"],
            rows, f"DAILY CACHE HIT RATE (last {top_n} days)\n  Hit = cache_read / total_input_context", f)
 
     # Per-model daily
@@ -135,6 +145,7 @@ def _section_cache_daily(stats, top_n, f):
             if model not in date_model_data[date]:
                 continue
             d = date_model_data[date][model]
+            c = estimate_cost(model, d["input_tokens"], d.get("output_tokens", 0), d["cache_read"], d["cache_create"])
             rows.append([
                 date,
                 format_tokens(d["cache_read"]),
@@ -142,13 +153,14 @@ def _section_cache_daily(stats, top_n, f):
                 format_tokens(d["input_tokens"]),
                 cache_hit_rate(d["cache_read"], d["cache_create"], d["input_tokens"]),
                 d["requests"],
+                format_cost(c),
             ])
         if rows:
             short = (model.replace("claude-", "")
                      .replace("-20251001", "").replace("-20251101", "")
                      .replace("-20250929", "").replace("-20250805", "")
                      .replace("-20250514", ""))
-            _table(["Date", "Cache Read", "Cache Create", "Uncached", "Hit Rate", "Reqs"],
+            _table(["Date", "Cache Read", "Cache Create", "Uncached", "Hit Rate", "Reqs", "Est Cost"],
                    rows, f"DAILY CACHE: {short}", f)
 
 
@@ -503,11 +515,28 @@ def write_daily_report(stats: dict, project_filter: str | None, top_n: int = 20)
     if proj_total_cost:
         print(f"  Est cost:  {format_cost(proj_total_cost)}  (cache saved ~{format_cost(proj_savings)})", file=f)
 
+    # Per-model daily breakdown for this project (from cache_by_date cross-ref)
+    # Rebuild per-model view from the global cache_by_date, filtered
+    date_model: dict[str, dict[str, dict]] = {}
+    for dm_key, d in stats["cache_by_date"].items():
+        date, model = dm_key.split("|", 1)
+        if date not in daily_data:
+            continue
+        date_model.setdefault(date, {})[model] = d
+
+    # Cost per day summed across models
+    day_cost: dict[str, float] = {
+        date: sum(
+            estimate_cost(m, d["input_tokens"], d.get("output_tokens", 0), d["cache_read"], d["cache_create"]) or 0.0
+            for m, d in models.items()
+        )
+        for date, models in date_model.items()
+    }
+
     # Main daily table
     rows = []
     for date in sorted(daily_data)[-top_n:]:
         d = daily_data[date]
-        total_ctx = d["input_tokens"] + d["cache_read"] + d["cache_create"]
         rows.append([
             date,
             format_tokens(d["cache_read"]),
@@ -518,21 +547,13 @@ def write_daily_report(stats: dict, project_filter: str | None, top_n: int = 20)
             d["requests"],
             d["tool_calls"],
             len(d["sessions"]),
+            format_cost(day_cost.get(date)),
         ])
     _table(
         ["Date", "Cache Read", "Cache Create", "Uncached", "Hit Rate",
-         "Output", "Reqs", "Tools", "Sessions"],
+         "Output", "Reqs", "Tools", "Sessions", "Est Cost"],
         rows, "DAILY USAGE & CACHE", f,
     )
-
-    # Per-model daily breakdown for this project (from cache_by_date cross-ref)
-    # Rebuild per-model view from the global cache_by_date, filtered
-    date_model: dict[str, dict[str, dict]] = {}
-    for dm_key, d in stats["cache_by_date"].items():
-        date, model = dm_key.split("|", 1)
-        if date not in daily_data:
-            continue
-        date_model.setdefault(date, {})[model] = d
 
     # Figure out which models are active
     model_totals: dict[str, int] = {}
